@@ -121,6 +121,7 @@ jobs:
             --key-ota keys/ota.key \
             --cert-ota keys/ota.crt \
             --rootless \
+            --clear-vbmeta-flags \
             --replace product patched/product.img \
             --replace system_ext patched/system_ext.img
           avbroot ota verify \
