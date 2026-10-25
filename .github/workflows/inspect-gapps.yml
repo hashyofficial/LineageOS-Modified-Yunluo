@@ -1,0 +1,85 @@
+name: Inspect Minimal GApps Compatibility
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/inspect-gapps.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+      - name: Install inspection dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y liblzma-dev erofs-utils
+          python -m pip install --upgrade gdown
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Download original yunluo OTA
+        env:
+          DRIVE_URL: "https://drive.google.com/drive/folders/1SWjco5A8nD8ml8GjiaqNKxORHI3YXXmC?usp=sharing"
+        run: |
+          mkdir -p downloads
+          gdown "$DRIVE_URL" -O downloads --continue --retries 3 --timeout 90
+      - name: Download Android 16 ARM64 GApps from upstream
+        env:
+          GAPPS_URL: "https://github.com/MindTheGapps/16.0.0-arm64/releases/download/MindTheGapps-16.0.0-arm64-20261023_034858/MindTheGapps-16.0.0-arm64-20261023_034858.zip"
+        run: |
+          mkdir -p inputs
+          curl -fL --retry 4 --retry-all-errors -o inputs/mindthegapps-16-arm64.zip "$GAPPS_URL"
+      - name: Extract candidate system images (not flashed)
+        run: |
+          mkdir -p extracted
+          OTA="$(find downloads -type f -iname '*yunluo.zip' -print -quit)"
+          test -n "$OTA"
+          payload-dumper-go -p product,system_ext -o extracted "$OTA"
+          mkdir -p inspection
+          file extracted/*.img | tee inspection/filesystem-types.txt
+          for f in extracted/*.img; do
+            echo "===== $f =====" >> inspection/filesystem-types.txt
+            blkid -p "$f" >> inspection/filesystem-types.txt || true
+          done
+          df -h . | tee inspection/runner-storage.txt
+      - name: Inspect GApps archive manifest and required pieces
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import zipfile,json
+          f=Path("inputs/mindthegapps-16-arm64.zip")
+          with zipfile.ZipFile(f) as z:
+              items=[dict(name=x.filename, size=x.file_size) for x in z.infolist()]
+              Path("inspection/gapps-file-list.json").write_text(json.dumps(items,indent=2))
+              selected=[x for x in items if any(s in x["name"].lower() for s in ["phonesky","gmscore","googleplayservices","googleservicesframework","privapp","permissions","sysconfig","setupwizard","config"])]
+              Path("inspection/filtered-gapps-files.json").write_text(json.dumps(selected,indent=2))
+              summary="# GApps compatibility inspection\n\n"
+              summary+=f"Files in GApps ZIP: **{len(items)}**\n\n"
+              summary+="## Google Play and permission/configuration paths\n\n"
+              summary+="\n".join(f"- {x['name']} ({x['size']} bytes)" for x in selected[:250])
+              Path("inspection/summary.md").write_text(summary)
+              print(summary[:20000])
+          PY
+          cat inspection/filesystem-types.txt
+          cat inspection/summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\n## Filesystem types\n\n' >> "$GITHUB_STEP_SUMMARY"
+          cat inspection/filesystem-types.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gapps-compatibility-report
+          path: inspection/
+          retention-days: 30
