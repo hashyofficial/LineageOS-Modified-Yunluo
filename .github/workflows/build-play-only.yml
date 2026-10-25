@@ -74,9 +74,9 @@ jobs:
       - name: Generate temporary per-run signing keys
         run: |
           mkdir -p keys
-          avbroot key generate-key -t rsa4096 -o keys/avb.key
-          avbroot key generate-key -t rsa4096 -o keys/ota.key
-          avbroot key generate-cert -k keys/ota.key -o keys/ota.crt
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out keys/avb.key 2>/dev/null
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out keys/ota.key 2>/dev/null
+          openssl req -new -x509 -sha256 -days 3650 -key keys/ota.key -out keys/ota.crt -subj "/CN=yunluo-playonly-ota/"
           avbroot key encode-avb -k keys/avb.key -o keys/avb_pkmd.bin
           echo "WARNING: Temporary signing keys are NOT uploaded; this artifact is an experimental compatibility candidate, NOT a verified device boot image." >> "$GITHUB_STEP_SUMMARY"
 
