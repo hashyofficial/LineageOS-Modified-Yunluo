@@ -1,0 +1,152 @@
+name: Build Play-Only LineageOS OTA (Experimental)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-play-only.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: false
+
+      - name: Install offline image tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y liblzma-dev xz-utils unzip
+          python -m pip install --upgrade gdown tomli-w
+          go install github.com/ssut/payload-dumper-go@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/.local/bin"
+          curl -fL --retry 4 -o /tmp/afsr.zip \
+            "https://github.com/chenxiaolong/afsr/releases/download/v2.0.0/afsr-2.0.0-x86_64-unknown-linux-gnu.zip"
+          unzip -j /tmp/afsr.zip -d /tmp/afsr-bin
+          install -m755 "$(find /tmp/afsr-bin -type f -name afsr -print -quit)" "$HOME/.local/bin/afsr"
+          curl -fL --retry 4 -o /tmp/avbroot.zip \
+            "https://github.com/chenxiaolong/avbroot/releases/download/v3.37.1/avbroot-3.37.1-x86_64-unknown-linux-gnu.zip"
+          unzip -j /tmp/avbroot.zip -d /tmp/avbroot-bin
+          install -m755 "$(find /tmp/avbroot-bin -type f -name avbroot -print -quit)" "$HOME/.local/bin/avbroot"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/afsr" --version
+          "$HOME/.local/bin/avbroot" --version
+
+      - name: Download original yunluo LineageOS
+        env:
+          DRIVE_URL: "https://drive.google.com/drive/folders/1SWjco5A8nD8ml8GjiaqNKxORHI3YXXmC?usp=sharing"
+        run: |
+          mkdir -p downloads
+          gdown "$DRIVE_URL" -O downloads --continue --retries 3 --timeout 90
+          find downloads -type f -printf '%p %s bytes\n'
+
+      - name: Download upstream Android 16 ARM64 GApps
+        env:
+          GAPPS_URL: "https://github.com/MindTheGapps/16.0.0-arm64/releases/download/MindTheGapps-16.0.0-arm64-20261023_034858/MindTheGapps-16.0.0-arm64-20261023_034858.zip"
+        run: |
+          mkdir -p inputs
+          curl -fL --retry 5 --retry-all-errors -o inputs/gapps.zip "$GAPPS_URL"
+          unzip -t inputs/gapps.zip | tail -n 2
+
+      - name: Extract only product and system_ext images
+        run: |
+          mkdir -p extracted
+          OTA="$(find downloads -type f -name 'lineage-*-yunluo.zip' -print -quit)"
+          test -n "$OTA"
+          payload-dumper-go -p product,system_ext -o extracted "$OTA"
+          file extracted/*.img
+          df -h .
+
+      - name: Generate temporary per-run signing keys
+        run: |
+          mkdir -p keys
+          avbroot key generate-key -t rsa4096 -o keys/avb.key
+          avbroot key generate-key -t rsa4096 -o keys/ota.key
+          avbroot key generate-cert -k keys/ota.key -o keys/ota.crt
+          avbroot key encode-avb -k keys/avb.key -o keys/avb_pkmd.bin
+          echo "WARNING: Temporary signing keys are NOT uploaded; this artifact is an experimental compatibility candidate, NOT a verified device boot image." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inject Play-only files into ext4 partitions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p work reports patched
+          for PART in product system_ext; do
+            mkdir -p "work/$PART"
+            (
+              cd "work/$PART"
+              avbroot avb unpack --input "$GITHUB_WORKSPACE/extracted/$PART.img"
+              rm "$GITHUB_WORKSPACE/extracted/$PART.img"
+              afsr unpack --input raw.img --output-tree fs_tree --output-metadata fs_metadata.toml
+              python "$GITHUB_WORKSPACE/scripts/inject_play_only.py" \
+                --gapps "$GITHUB_WORKSPACE/inputs/gapps.zip" \
+                --partition "$PART" \
+                --tree fs_tree \
+                --metadata fs_metadata.toml \
+                --report "$GITHUB_WORKSPACE/reports/$PART-injected.json"
+              afsr pack --output rebuilt.raw.img --input-tree fs_tree --input-metadata fs_metadata.toml
+              mv rebuilt.raw.img raw.img
+              rm -rf fs_tree
+              avbroot avb pack --output "$GITHUB_WORKSPACE/patched/$PART.img" \
+                --key "$GITHUB_WORKSPACE/keys/avb.key" --recompute-size
+              rm -f raw.img
+            )
+            df -h .
+          done
+
+      - name: Rebuild signed OTA with modified partitions
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OTA="$(find downloads -type f -name 'lineage-*-yunluo.zip' -print -quit)"
+          mkdir -p output
+          avbroot ota patch \
+            --input "$OTA" \
+            --output output/lineage-23.0-20251015-yunluo-PlayOnly-EXPERIMENTAL.zip \
+            --key-avb keys/avb.key \
+            --key-ota keys/ota.key \
+            --cert-ota keys/ota.crt \
+            --rootless \
+            --replace product patched/product.img \
+            --replace system_ext patched/system_ext.img
+          avbroot ota verify \
+            --input output/lineage-23.0-20251015-yunluo-PlayOnly-EXPERIMENTAL.zip \
+            --cert-ota keys/ota.crt \
+            --public-key-avb keys/avb_pkmd.bin
+          sha256sum output/*.zip | tee reports/output-sha256.txt
+          printf '\n### Built ZIP verified by avbroot (cryptographic and structural validation only)\n\n' >> "$GITHUB_STEP_SUMMARY"
+          cat reports/output-sha256.txt >> "$GITHUB_STEP_SUMMARY"
+          printf '\n**NOT device-boot-tested. Do not flash until recovery trust and AVB compatibility are confirmed.**\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: play-only-build-reports
+          path: reports/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload verified OTA candidate (no signing keys)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lineage23-yunluo-PlayOnly-EXPERIMENTAL
+          path: output/*.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
